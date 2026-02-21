@@ -1,13 +1,13 @@
 import { ethers } from "ethers";
-import WebSocket from "ws";
 import { DEXES, TOKENS } from "../config/addresses";
 import { UNISWAP_V3_POOL_ABI, UNISWAP_V2_PAIR_ABI } from "../config/abis";
 import { logger } from "../utils/Logger";
+import { AlchemyWebSocketProvider } from "./AlchemyWebSocket";
 
-// ═══════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════
 //                    MEMPOOL MONITOR
 //  Watches pending transactions and pool events for arb triggers
-// ═══════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════
 
 export interface PendingSwap {
     txHash: string;
@@ -37,7 +37,7 @@ type SwapCallback = (swap: PendingSwap) => void;
 type PoolUpdateCallback = (update: PoolUpdate) => void;
 
 export class MempoolMonitor {
-    private wsProvider: ethers.WebSocketProvider | null = null;
+    private wsProvider: AlchemyWebSocketProvider | null = null;
     private httpProvider: ethers.Provider;
     private wsUrl: string;
     private onSwapCallbacks: SwapCallback[] = [];
@@ -69,9 +69,9 @@ export class MempoolMonitor {
         ]);
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════
     //                    EVENT SUBSCRIPTIONS
-    // ═══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════
 
     onSwap(callback: SwapCallback): void {
         this.onSwapCallbacks.push(callback);
@@ -81,9 +81,9 @@ export class MempoolMonitor {
         this.onPoolUpdateCallbacks.push(callback);
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════
     //                    START MONITORING
-    // ═══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════
 
     async start(): Promise<void> {
         if (this.isRunning) return;
@@ -118,16 +118,54 @@ export class MempoolMonitor {
         logger.info("🛑 Mempool monitor stopped");
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════
     //                    WEBSOCKET CONNECTION
-    // ═══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════
 
     private async connectWebSocket(): Promise<void> {
         try {
-            this.wsProvider = new ethers.WebSocketProvider(this.wsUrl);
+            // Validate and auto-correct WebSocket URL
+            if (!this.wsUrl || this.wsUrl.trim() === "") {
+                throw new Error("WebSocket URL is empty. Please set WS_URL in .env file");
+            }
 
-            // Monitor pending transactions
-            this.wsProvider.on("pending", async (txHash: string) => {
+            // Auto-correct common mistake: using https instead of wss
+            let correctedUrl = this.wsUrl;
+            if (this.wsUrl.startsWith("https://")) {
+                correctedUrl = this.wsUrl.replace("https://", "wss://");
+                logger.warn("⚠️  Auto-corrected WebSocket URL from https:// to wss://");
+                logger.warn(`   Original: ${this.wsUrl}`);
+                logger.warn(`   Corrected: ${correctedUrl}`);
+            } else if (this.wsUrl.startsWith("http://")) {
+                correctedUrl = this.wsUrl.replace("http://", "ws://");
+                logger.warn("⚠️  Auto-corrected WebSocket URL from http:// to ws:// (insecure)");
+                logger.warn(`   Original: ${this.wsUrl}`);
+                logger.warn(`   Corrected: ${correctedUrl}`);
+            }
+
+            // Validate it's a proper WebSocket URL
+            if (!correctedUrl.startsWith("wss://") && !correctedUrl.startsWith("ws://")) {
+                throw new Error("Invalid WebSocket URL format. Must start with wss:// or ws://");
+            }
+
+            // Use our custom AlchemyWebSocketProvider for better compatibility
+            this.wsProvider = new AlchemyWebSocketProvider(this.httpProvider, correctedUrl);
+            
+            logger.info(`⏳ Connecting to WebSocket...`);
+            
+            // Connect with timeout
+            const connectPromise = this.wsProvider.connect();
+            const timeoutPromise = new Promise<void>((_, reject) => {
+                setTimeout(() => {
+                    reject(new Error("WebSocket connection timeout (15s) - See WEBSOCKET_FIX_SUMMARY.md for troubleshooting"));
+                }, 15000);
+            });
+
+            await Promise.race([connectPromise, timeoutPromise]);
+
+            // Subscribe to pending transactions
+            logger.info(`📡 Subscribing to pending transactions...`);
+            await this.wsProvider.subscribeToPendingTxs(async (txHash: string) => {
                 try {
                     await this.processPendingTx(txHash);
                 } catch {
@@ -135,22 +173,25 @@ export class MempoolMonitor {
                 }
             });
 
-            // Handle disconnection
-            this.wsProvider.websocket.on("close", () => {
-                if (this.isRunning) {
-                    logger.warn("WebSocket disconnected, reconnecting...");
-                    this.reconnect();
-                }
-            });
-
-            this.wsProvider.websocket.on("error", (error: Error) => {
-                logger.error(`WebSocket error: ${error.message}`);
-            });
-
+            logger.info(`✅ WebSocket monitor ready`);
             this.reconnectAttempts = 0;
-            logger.info(`📡 WebSocket connected to ${this.wsUrl.substring(0, 40)}...`);
+
         } catch (error: any) {
             logger.error(`WebSocket connection failed: ${error.message}`);
+            
+            // Check for rate limiting error
+            if (error.message.includes('429') || error.message.includes('Too Many Requests')) {
+                logger.error("🚫 Rate limit (429) detected!");
+                logger.error("💡 Solutions:");
+                logger.error("   1. Get a free Alchemy API key: https://www.alchemy.com/");
+                logger.error("   2. Use Infura: https://infura.io/");
+                logger.error("   3. Wait longer between connection attempts");
+                // Increase delay for rate limit errors
+                this.maxReconnectAttempts = 20;
+            } else if (this.wsUrl && this.wsUrl.trim() === "") {
+                logger.error("💡 Hint: Add WS_URL to your .env file. Get a free API key from https://www.alchemy.com/");
+            }
+            
             await this.reconnect();
         }
     }
@@ -164,16 +205,17 @@ export class MempoolMonitor {
         }
 
         this.reconnectAttempts++;
-        const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
-        logger.info(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+        // Increase backoff time to avoid rate limits
+        const delay = Math.min(5000 * Math.pow(1.5, this.reconnectAttempts), 60000); // Start at 5s, max 60s
+        logger.info(`Reconnecting in ${(delay/1000).toFixed(1)}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
 
         await new Promise((resolve) => setTimeout(resolve, delay));
         await this.connectWebSocket();
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════
     //                PENDING TX PROCESSING
-    // ═══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════
 
     private async processPendingTx(txHash: string): Promise<void> {
         if (!this.wsProvider) return;
@@ -262,9 +304,9 @@ export class MempoolMonitor {
         return "UNKNOWN";
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════
     //                    POOL EVENT MONITORING
-    // ═══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════
 
     private async subscribeToPoolEvents(): Promise<void> {
         // Subscribe to Swap events on major V3 pools
@@ -337,14 +379,14 @@ export class MempoolMonitor {
         this.poolSubscriptions.set(pairAddress, pair);
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════
     //                    STATUS
-    // ═══════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════
 
     getStatus() {
         return {
             isRunning: this.isRunning,
-            wsConnected: this.wsProvider !== null,
+            wsConnected: this.wsProvider !== null && this.wsProvider.connected(),
             reconnectAttempts: this.reconnectAttempts,
             poolSubscriptions: this.poolSubscriptions.size,
         };

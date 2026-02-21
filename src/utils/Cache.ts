@@ -58,7 +58,7 @@ export class Cache<T> {
     if (this.maxSize > 0 && this.cache.size >= this.maxSize) {
       // Remove oldest entry
       const oldestKey = this.cache.keys().next().value;
-      this.cache.delete(oldestKey);
+      if (oldestKey !== undefined) { this.cache.delete(oldestKey); }
     }
 
     this.cache.set(key, {
@@ -228,7 +228,7 @@ export class LRUCache<T> {
     // Remove oldest if at capacity
     if (this.cache.size >= this.maxSize) {
       const oldestKey = this.cache.keys().next().value;
-      this.cache.delete(oldestKey);
+      if (oldestKey !== undefined) { this.cache.delete(oldestKey); }
     }
 
     this.cache.set(key, { value, timestamp: Date.now() });

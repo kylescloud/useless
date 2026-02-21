@@ -402,11 +402,11 @@ async function main() {
     dotenv.config();
 
     const config: EngineConfig = {
-        rpcUrl: process.env.BASE_RPC_URL || "https://mainnet.base.org",
-        rpcWss: process.env.BASE_RPC_WSS || "",
-        rpcBackup: process.env.BASE_RPC_BACKUP || "https://base.llamarpc.com",
-        executorPrivateKey: process.env.EXECUTOR_PRIVATE_KEY || "",
-        contractAddress: process.env.ARB_CONTRACT_ADDRESS || ethers.ZeroAddress,
+        rpcUrl: process.env.RPC_URL || process.env.BASE_RPC_URL || "https://mainnet.base.org",
+        rpcWss: process.env.WS_URL || process.env.WS_RPC_URL || process.env.BASE_RPC_WSS || "",
+        rpcBackup: process.env.BACKUP_RPC_URL || process.env.BASE_RPC_BACKUP || "https://base.llamarpc.com",
+        executorPrivateKey: process.env.PRIVATE_KEY || process.env.EXECUTOR_PRIVATE_KEY || "",
+        contractAddress: process.env.CONTRACT_ADDRESS || process.env.ARB_CONTRACT_ADDRESS || ethers.ZeroAddress,
         zeroExApiKey: process.env.ZEROX_API_KEY || "",
         minProfitUsd: parseFloat(process.env.MIN_PROFIT_USD || "0.50"),
         maxGasPriceGwei: parseFloat(process.env.MAX_GAS_PRICE_GWEI || "0.5"),
@@ -416,7 +416,7 @@ async function main() {
     };
 
     if (!config.executorPrivateKey) {
-        logger.error("EXECUTOR_PRIVATE_KEY is required");
+        logger.error("PRIVATE_KEY or EXECUTOR_PRIVATE_KEY is required");
         process.exit(1);
     }
 

@@ -16,7 +16,7 @@ async function main() {
   const arbitrage = await upgrades.deployProxy(
     FlashLoanArbitrage,
     [
-      process.env.AAVE_POOL_ADDRESS || "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5", // Aave V3 Pool
+      process.env.AAVE_POOL_ADDRESSES_PROVIDER || "0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D", // Aave V3 PoolAddressesProvider
       deployer.address, // Owner
       process.env.MAX_FLASH_LOAN_AMOUNT || ethers.parseEther("1000"), // Max flash loan amount
     ],

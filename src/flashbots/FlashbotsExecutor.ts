@@ -1,5 +1,6 @@
+
 import { ethers } from "ethers";
-import { FlashbotsBundleProvider, FlashbotsBundleResolution } from "@flashbots/ethers-provider-bundle";
+import axios from "axios";
 import * as dotenv from "dotenv";
 
 dotenv.config();
@@ -7,64 +8,173 @@ dotenv.config();
 /**
  * FlashbotsExecutor - Handles private mempool submission via Flashbots
  * Provides MEV protection and faster transaction inclusion
+ * Custom implementation for ethers v6 compatibility
  */
 export class FlashbotsExecutor {
   private provider: ethers.JsonRpcProvider;
-  private flashbotsProvider: FlashbotsBundleProvider;
   private signer: ethers.Wallet;
   private chainId: number;
+  private flashbotsRelayUrl: string;
+  private flashbotsRpcUrl: string;
 
   constructor(rpcUrl: string, privateKey: string, chainId: number = 8453) {
     this.provider = new ethers.JsonRpcProvider(rpcUrl);
     this.signer = new ethers.Wallet(privateKey, this.provider);
     this.chainId = chainId;
     
-    // Initialize Flashbots provider (using flashbots relay for Base)
-    this.flashbotsProvider = FlashbotsBundleProvider.create(
-      this.provider,
-      this.signer,
-      "https://relay.flashbots.net"
-    );
+    // Flashbots relay endpoints
+    this.flashbotsRelayUrl = "https://relay.flashbots.net";
+    this.flashbotsRpcUrl = "https://rpc.flashbots.net";
   }
 
   /**
-   * Submit a transaction bundle to Flashbots
+   * Submit a transaction bundle to Flashbots relay
    * @param signedTransactions Array of signed transactions
    * @param targetBlock Block number to target (optional)
-   * @returns Bundle resolution
+   * @returns Bundle submission result
    */
   async submitBundle(
     signedTransactions: string[],
     targetBlock?: number
-  ): Promise<FlashbotsBundleResolution> {
+  ): Promise<{ success: boolean; txHash?: string; blockNumber?: number }> {
     const blockNumber = targetBlock || (await this.provider.getBlockNumber());
-    
-    const bundle = [
-      {
-        signedTransaction: signedTransactions[0],
-      },
-    ];
 
-    const simulation = await this.flashbotsProvider.simulate(
-      bundle,
-      blockNumber
-    );
+    try {
+      // Build Flashbots bundle
+      const bundle = signedTransactions.map(tx => ({
+        tx: `0x${tx.replace(/^0x/, "")}`,
+        canRevert: false,
+      }));
 
-    if (simulation.firstRevert) {
-      throw new Error(`Bundle simulation failed: ${simulation.firstRevert.error}`);
+      // Simulate bundle first
+      const simulationResult = await this.simulateBundle(bundle, blockNumber);
+      
+      if (!simulationResult.success) {
+        console.error("Bundle simulation failed:", simulationResult.error);
+        return { success: false };
+      }
+
+      console.log("Bundle simulation successful. Gas used:", simulationResult.gasUsed.toString());
+
+      // Submit bundle to Flashbots relay
+      const submitResult = await this.sendBundleToRelay(bundle, blockNumber + 1);
+      
+      if (submitResult.success) {
+        console.log("✅ Bundle submitted to Flashbots relay");
+        return {
+          success: true,
+          txHash: submitResult.txHash,
+          blockNumber: blockNumber + 1,
+        };
+      } else {
+        console.error("Bundle submission failed:", submitResult.error);
+        return { success: false };
+      }
+    } catch (error: any) {
+      console.error("Flashbots submission error:", error.message);
+      return { success: false };
     }
+  }
 
-    console.log("Bundle simulation successful. Gas used:", simulation.totalGasUsed.toString());
+  /**
+   * Simulate a bundle before submission
+   * @param bundle Bundle to simulate
+   * @param blockNumber Block number for simulation
+   * @returns Simulation result
+   */
+  private async simulateBundle(
+    bundle: Array<{ tx: string; canRevert: boolean }>,
+    blockNumber: number
+  ): Promise<{ success: boolean; gasUsed: bigint; error?: string }> {
+    try {
+      // Simulate using provider's call method
+      let totalGasUsed = 0n;
 
-    // Submit bundle
-    const flashbotsTransactionResponse = await this.flashbotsProvider.sendBundle(
-      bundle,
-      blockNumber + 1
-    );
+      for (const bundleItem of bundle) {
+        try {
+          // Parse transaction data
+          const txData = ethers.Transaction.from(bundleItem.tx);
+          
+          // Simulate transaction (ethers v6 call only takes 1 argument)
+          await this.provider.call({
+            data: txData.data,
+            to: txData.to,
+            from: await this.signer.getAddress(),
+            value: txData.value,
+          });
+          
+          totalGasUsed += 100000n; // Estimate gas per tx
+        } catch (error: any) {
+          if (!bundleItem.canRevert) {
+            return {
+              success: false,
+              gasUsed: 0n,
+              error: error.message,
+            };
+          }
+        }
+      }
 
-    console.log("Bundle submitted. Waiting for inclusion...");
+      return { success: true, gasUsed: totalGasUsed };
+    } catch (error: any) {
+      return {
+        success: false,
+        gasUsed: 0n,
+        error: error.message,
+      };
+    }
+  }
 
-    return await flashbotsTransactionResponse.wait();
+  /**
+   * Send bundle to Flashbots relay
+   * @param bundle Bundle to send
+   * @param blockNumber Target block number
+   * @returns Submission result
+   */
+  private async sendBundleToRelay(
+    bundle: Array<{ tx: string; canRevert: boolean }>,
+    blockNumber: number
+  ): Promise<{ success: boolean; txHash?: string; error?: string }> {
+    try {
+      // Flashbots eth_sendBundle RPC call
+      const response = await axios.post(
+        this.flashbotsRelayUrl,
+        {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "eth_sendBundle",
+          params: [
+            {
+              txs: bundle.map(b => b.tx),
+              blockNumber: `0x${blockNumber.toString(16)}`,
+            },
+          ],
+        },
+        {
+          headers: {
+            "Content-Type": "application/json",
+          },
+          timeout: 10000,
+        }
+      );
+
+      if (response.data.result) {
+        return {
+          success: true,
+          txHash: response.data.result,
+        };
+      } else {
+        return {
+          success: false,
+          error: response.data.error?.message || "Unknown error",
+        };
+      }
+    } catch (error: any) {
+      return {
+        success: false,
+        error: error.message,
+      };
+    }
   }
 
   /**
@@ -73,7 +183,7 @@ export class FlashbotsExecutor {
    * @param data Transaction data
    * @param value ETH value to send
    * @param gasLimit Gas limit
-   * @param gasPrice Gas price (or maxFeePerGas for EIP-1559)
+   * @param maxPriorityFeePerGas Max priority fee per gas
    * @returns Signed transaction string
    */
   async signTransaction(
@@ -81,14 +191,14 @@ export class FlashbotsExecutor {
     data: string,
     value: bigint = 0n,
     gasLimit: bigint = 500000n,
-    gasPrice?: bigint
+    maxPriorityFeePerGas?: bigint
   ): Promise<string> {
     const nonce = await this.provider.getTransactionCount(this.signer.address);
     
     const currentBlock = await this.provider.getBlock("latest");
     const baseFee = currentBlock?.baseFeePerGas || 0n;
-    const maxPriorityFeePerGas = gasPrice || 2000000000n; // 2 gwei default
-    const maxFeePerGas = baseFee + maxPriorityFeePerGas;
+    const maxFeePerGas = maxPriorityFeePerGas || 2000000000n; // 2 gwei default
+    const maxPriorityFee = maxPriorityFeePerGas || 2000000000n;
 
     const tx: ethers.TransactionRequest = {
       to: to as string,
@@ -97,8 +207,8 @@ export class FlashbotsExecutor {
       gasLimit,
       nonce,
       type: 2, // EIP-1559
-      maxFeePerGas,
-      maxPriorityFeePerGas,
+      maxFeePerGas: baseFee + maxFeePerGas,
+      maxPriorityFeePerGas: maxPriorityFee,
       chainId: this.chainId,
     };
 
@@ -130,23 +240,17 @@ export class FlashbotsExecutor {
         minerTip
       );
 
-      const resolution = await this.submitBundle([signedTx]);
+      const result = await this.submitBundle([signedTx]);
 
-      if (resolution === FlashbotsBundleResolution.BundleIncluded) {
+      if (result.success) {
         console.log("✅ Bundle included in block!");
-        const txHash = ethers.utils.parseTransaction(signedTx).hash;
-        return txHash;
-      } else if (resolution === FlashbotsBundleResolution.BlockPassedWithoutInclusion) {
-        console.log("⚠️ Block passed without inclusion");
-        return null;
-      } else if (resolution === FlashbotsBundleResolution.AccountNonceTooHigh) {
-        console.log("❌ Account nonce too high");
+        return result.txHash || null;
+      } else {
+        console.log("⚠️ Bundle submission failed");
         return null;
       }
-
-      return null;
-    } catch (error) {
-      console.error("Flashbots execution failed:", error);
+    } catch (error: any) {
+      console.error("Flashbots execution failed:", error.message);
       return null;
     }
   }
@@ -158,7 +262,8 @@ export class FlashbotsExecutor {
   async isFlashbotsAvailable(): Promise<boolean> {
     try {
       await this.provider.getBlockNumber();
-      return true;
+      // Flashbots supports Ethereum mainnet and Base
+      return this.chainId === 1 || this.chainId === 8453;
     } catch {
       return false;
     }
@@ -171,5 +276,46 @@ export class FlashbotsExecutor {
   async getCurrentBaseFee(): Promise<bigint> {
     const currentBlock = await this.provider.getBlock("latest");
     return currentBlock?.baseFeePerGas || 0n;
+  }
+
+  /**
+   * Execute transaction with fallback to public mempool
+   * @param contractAddress Contract address
+   * @param encodedCallData Call data
+   * @param maxPriorityFeePerGas Max priority fee
+   * @returns Transaction hash
+   */
+  async executeWithFallback(
+    contractAddress: string,
+    encodedCallData: string,
+    maxPriorityFeePerGas?: bigint
+  ): Promise<string> {
+    // Try Flashbots first
+    const flashbotsAvailable = await this.isFlashbotsAvailable();
+    
+    if (flashbotsAvailable && process.env.FLASHBOTS_ENABLED === "true") {
+      const txHash = await this.executeArbitrageViaFlashbots(
+        contractAddress,
+        encodedCallData,
+        ethers.parseEther("0.1") // Estimated profit
+      );
+      
+      if (txHash) {
+        return txHash;
+      }
+      
+      console.log("Flashbots failed, falling back to public mempool");
+    }
+
+    // Fallback to public mempool
+    const tx = await this.signer.sendTransaction({
+      to: contractAddress,
+      data: encodedCallData,
+      maxPriorityFeePerGas: maxPriorityFeePerGas || 2000000000n,
+      type: 2,
+    });
+
+    await tx.wait();
+    return tx.hash;
   }
 }

@@ -18,7 +18,7 @@ const config: HardhatUserConfig = {
         runs: 1000000,
       },
       viaIR: true,
-      evmVersion: "cancun",
+      
     },
   },
   networks: {

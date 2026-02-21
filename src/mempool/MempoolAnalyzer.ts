@@ -1,5 +1,5 @@
 import { ethers } from "ethers";
-import WebSocket from "ws";
+import dotenv from "dotenv";
 
 /**
  * MempoolAnalyzer - Analyzes pending transactions for MEV protection
@@ -7,7 +7,7 @@ import WebSocket from "ws";
  */
 export class MempoolAnalyzer {
   private wsProvider: ethers.WebSocketProvider;
-  private pendingTxCache: Map<string, ethers.Transaction> = new Map();
+  private pendingTxCache: Map<string, ethers.TransactionResponse> = new Map();
   private knownArbitrageBots: Set<string> = new Set();
   private sandwichSuspects: Set<string> = new Set();
 
@@ -36,12 +36,12 @@ export class MempoolAnalyzer {
    * Analyze a pending transaction for potential threats
    * @param tx Transaction to analyze
    */
-  private analyzeTransaction(tx: ethers.Transaction): void {
+  private analyzeTransaction(tx: ethers.TransactionResponse): void {
     if (!tx.to) return;
 
     // Check for large swaps (potential sandwich targets)
     if (this.isLargeSwap(tx)) {
-      console.log(`🚨 Large swap detected from ${tx.from}: ${tx.hash}`);
+      console.log(`⚠️ Large swap detected from ${tx.from}: ${tx.hash}`);
       this.markAsSuspect(tx.from);
     }
 
@@ -63,7 +63,9 @@ export class MempoolAnalyzer {
     // Clean old transactions from cache
     if (this.pendingTxCache.size > 1000) {
       const oldestTx = this.pendingTxCache.keys().next().value;
-      this.pendingTxCache.delete(oldestTx);
+      if (oldestTx) {
+        this.pendingTxCache.delete(oldestTx);
+      }
     }
   }
 
@@ -72,7 +74,7 @@ export class MempoolAnalyzer {
    * @param tx Transaction to check
    * @returns True if large swap
    */
-  private isLargeSwap(tx: ethers.Transaction): boolean {
+  private isLargeSwap(tx: ethers.TransactionResponse): boolean {
     if (!tx.value || tx.value === 0n) return false;
     
     // Consider swaps over 10 ETH as large
@@ -85,7 +87,7 @@ export class MempoolAnalyzer {
    * @param tx Transaction to check
    * @returns True if arbitrage transaction
    */
-  private isArbitrageTransaction(tx: ethers.Transaction): boolean {
+  private isArbitrageTransaction(tx: ethers.TransactionResponse): boolean {
     if (!tx.data || tx.data.length < 10) return false;
 
     // Check for common DEX function selectors
@@ -106,12 +108,13 @@ export class MempoolAnalyzer {
    * @param tx Transaction to check
    * @returns True if potential sandwich attack
    */
-  private isPotentialSandwichAttack(tx: ethers.Transaction): boolean {
+  private isPotentialSandwichAttack(tx: ethers.TransactionResponse): boolean {
     // Check if this transaction is targeting a recent large swap
     for (const [hash, cachedTx] of this.pendingTxCache) {
       if (this.sandwichSuspects.has(cachedTx.from) &&
           tx.to === cachedTx.to &&
-          Math.abs(tx.value! - cachedTx.value!) < cachedTx.value! / 100n) {
+          tx.value && cachedTx.value &&
+          tx.value - cachedTx.value < cachedTx.value / 100n) {
         // Same target, similar value - potential sandwich
         return true;
       }
@@ -162,8 +165,8 @@ export class MempoolAnalyzer {
    * @param targetContract Target contract address
    * @returns Array of competing transactions
    */
-  public getCompetingTransactions(targetContract: string): ethers.Transaction[] {
-    const competing: ethers.Transaction[] = [];
+  public getCompetingTransactions(targetContract: string): ethers.TransactionResponse[] {
+    const competing: ethers.TransactionResponse[] = [];
 
     for (const tx of this.pendingTxCache.values()) {
       if (tx.to === targetContract && 
@@ -263,7 +266,7 @@ export class MempoolAnalyzer {
    * @param tx Transaction to check
    * @returns Front-running risk level (0-3)
    */
-  public getFrontRunningRisk(tx: ethers.Transaction): number {
+  public getFrontRunningRisk(tx: ethers.TransactionResponse): number {
     let risk = 0;
 
     // Check if similar transactions are pending
@@ -287,7 +290,7 @@ export class MempoolAnalyzer {
    * @param tx Transaction to analyze
    * @returns Protection recommendations
    */
-  public getProtectionRecommendations(tx: ethers.Transaction): {
+  public getProtectionRecommendations(tx: ethers.TransactionResponse): {
     usePrivatePool: boolean;
     increaseSlippage: boolean;
     recommendedSlippage: number;
