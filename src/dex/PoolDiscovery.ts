@@ -8,12 +8,14 @@ import {
     ERC20_ABI,
 } from "../config/abis";
 import { logger } from "../utils/Logger";
+import * as fs from "fs";
+import * as path from "path";
 
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 //                    POOL DISCOVERY ENGINE
 //  Dynamically discovers all pools across Base DEX factories,
 //  filters by liquidity, and generates tradeable pair combinations
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 
 export interface DiscoveredPool {
     dexId: DEXId;
@@ -52,9 +54,9 @@ interface FactoryConfig {
     feeTiers?: number[];
 }
 
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 //                    EXTENDED ABIs FOR DISCOVERY
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 
 const V3_FACTORY_FULL_ABI = [
     "function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool)",
@@ -104,9 +106,9 @@ const AERODROME_POOL_FULL_ABI = [
     "function getAmountOut(uint256 amountIn, address tokenIn) external view returns (uint256)",
 ];
 
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 //                    TOKEN REGISTRY
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 
 class TokenRegistry {
     private tokens: Map<string, { symbol: string; decimals: number; priceUsd: number }> = new Map();
@@ -192,9 +194,9 @@ class TokenRegistry {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 //                    POOL DISCOVERY ENGINE
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 
 export class PoolDiscovery {
     private provider: ethers.Provider;
@@ -206,6 +208,8 @@ export class PoolDiscovery {
     private minLiquidityUsd: number;
     private lastScanBlock: number = 0;
     private refreshTimer: NodeJS.Timeout | null = null;
+    private persistencePath: string;
+    private autoSave: boolean;
 
     // Factory configurations for all Base DEXs
     private factories: FactoryConfig[] = [
@@ -269,37 +273,164 @@ export class PoolDiscovery {
         config: {
             refreshIntervalMs?: number;
             minLiquidityUsd?: number;
+            persistencePath?: string;
+            autoSave?: boolean;
         } = {}
     ) {
         this.provider = provider;
         this.tokenRegistry = new TokenRegistry(provider);
-        this.refreshIntervalMs = config.refreshIntervalMs || 300000; // 5 min default
+        this.refreshIntervalMs = config.refreshIntervalMs || (7 * 24 * 60 * 60 * 1000); // 7 days default
         this.minLiquidityUsd = config.minLiquidityUsd || 10000; // $10k min
+        this.persistencePath = config.persistencePath || path.join(process.cwd(), "data", "pools.json");
+        this.autoSave = config.autoSave !== false; // Default to true
+        
+        // Ensure data directory exists
+        const dataDir = path.dirname(this.persistencePath);
+        if (!fs.existsSync(dataDir)) {
+            fs.mkdirSync(dataDir, { recursive: true });
+        }
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════════
+    //                    PERSISTENCE
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Save discovered pools to disk
+     */
+    private savePools(): void {
+        if (!this.autoSave) return;
+
+        try {
+            const data = {
+                version: "1.0",
+                timestamp: Date.now(),
+                lastScanBlock: this.lastScanBlock,
+                pools: Array.from(this.discoveredPools.entries()).map(([key, pool]) => [
+                    key,
+                    {
+                        ...pool,
+                        liquidity: pool.liquidity.toString(),
+                        reserve0: pool.reserve0.toString(),
+                        reserve1: pool.reserve1.toString(),
+                    }
+                ]),
+                tradePairs: Array.from(this.tradePairs.entries()),
+            };
+
+            fs.writeFileSync(this.persistencePath, JSON.stringify(data, null, 2));
+            logger.debug(`💾 Saved ${this.discoveredPools.size} pools to ${this.persistencePath}`);
+        } catch (error: any) {
+            logger.error(`Failed to save pools: ${error.message}`);
+        }
+    }
+
+    /**
+     * Load discovered pools from disk
+     */
+    private loadPools(): boolean {
+        if (!fs.existsSync(this.persistencePath)) {
+            logger.info("📂 No saved pools found, will perform full scan");
+            return false;
+        }
+
+        try {
+            const data = JSON.parse(fs.readFileSync(this.persistencePath, "utf-8"));
+            
+            // Validate data structure
+            if (!data.pools || !Array.isArray(data.pools)) {
+                logger.warn("⚠️  Invalid pool data format, will perform full scan");
+                return false;
+            }
+
+            // Check if data is stale (older than 7 days)
+            const ageDays = (Date.now() - data.timestamp) / (1000 * 60 * 60 * 24);
+            if (ageDays > 7) {
+                logger.info(`📂 Pool data is ${ageDays.toFixed(1)} days old, will perform full scan`);
+                return false;
+            }
+
+            // Restore pools and convert BigInt strings back to BigInt
+            this.discoveredPools = new Map(
+                data.pools.map(([key, pool]: [string, any]) => [
+                    key,
+                    {
+                        ...pool,
+                        liquidity: BigInt(pool.liquidity),
+                        reserve0: BigInt(pool.reserve0),
+                        reserve1: BigInt(pool.reserve1),
+                    }
+                ])
+            );
+            this.lastScanBlock = data.lastScanBlock || 0;
+
+            // Restore trade pairs if available
+            if (data.tradePairs && Array.isArray(data.tradePairs)) {
+                this.tradePairs = new Map(data.tradePairs);
+            }
+
+            logger.info(`✅ Loaded ${this.discoveredPools.size} pools from ${this.persistencePath}`);
+            logger.info(`   Last scan: block ${this.lastScanBlock} (${ageDays.toFixed(1)} days ago)`);
+            
+            return true;
+        } catch (error: any) {
+            logger.warn(`⚠️  Failed to load pools: ${error.message}, will perform full scan`);
+            return false;
+        }
+    }
+
+    /**
+     * Clear saved pool data (useful for forcing a fresh scan)
+     */
+    clearSavedPools(): void {
+        try {
+            if (fs.existsSync(this.persistencePath)) {
+                fs.unlinkSync(this.persistencePath);
+                logger.info("🗑️  Cleared saved pool data");
+            }
+        } catch (error: any) {
+            logger.error(`Failed to clear saved pools: ${error.message}`);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
     //                    LIFECYCLE
-    // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════════
 
     async start(ethPrice: number, btcPrice: number): Promise<void> {
-        logger.info("🔎 Starting dynamic pool discovery engine...");
+        logger.info("🔍 Starting dynamic pool discovery engine...");
         this.isRunning = true;
         this.tokenRegistry.updatePrices(ethPrice, btcPrice);
 
-        // Initial full scan
-        await this.fullScan();
+        // Try to load saved pools first
+        const loaded = this.loadPools();
+        
+        if (loaded) {
+            // Refresh liquidity for loaded pools
+            await this.refreshLiquidity();
+            // Build trade pairs from loaded pools
+            this.buildTradePairs();
+            // Perform incremental scan for new blocks
+            await this.incrementalScan();
+        } else {
+            // Initial full scan
+            await this.fullScan();
+        }
 
-        // Start periodic refresh
+        // Start periodic refresh (every 7 days by default)
         this.refreshTimer = setInterval(async () => {
             try {
                 await this.incrementalScan();
                 await this.refreshLiquidity();
+                // Auto-save after each refresh
+                this.savePools();
             } catch (error: any) {
                 logger.error(`Pool discovery refresh error: ${error.message}`);
             }
         }, this.refreshIntervalMs);
 
-        logger.info(`✅ Pool discovery running. Refresh every ${this.refreshIntervalMs / 1000}s. Min liquidity: $${this.minLiquidityUsd}`);
+        const refreshDays = (this.refreshIntervalMs / (1000 * 60 * 60 * 24)).toFixed(1);
+        logger.info(`✅ Pool discovery running. Refresh every ${refreshDays} days. Min liquidity: $${this.minLiquidityUsd}`);
     }
 
     stop(): void {
@@ -315,9 +446,9 @@ export class PoolDiscovery {
         this.tokenRegistry.updatePrices(ethPrice, btcPrice);
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════════
     //                    FULL HISTORICAL SCAN
-    // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════════
 
     private async fullScan(): Promise<void> {
         const currentBlock = await this.provider.getBlockNumber();
@@ -330,6 +461,10 @@ export class PoolDiscovery {
                 const count = await this.scanFactory(factory, factory.startBlock, currentBlock);
                 totalDiscovered += count;
                 logger.info(`  ✓ ${factory.dexName}: ${count} pools discovered`);
+                
+                // Save progress after each DEX
+                this.savePools();
+                logger.debug(`  💾 Saved progress: ${this.discoveredPools.size} pools total`);
             } catch (error: any) {
                 logger.warn(`  ✗ ${factory.dexName} scan failed: ${error.message}`);
             }
@@ -343,12 +478,15 @@ export class PoolDiscovery {
         // Build trade pairs from discovered pools
         this.buildTradePairs();
 
+        // Final save with complete data
+        this.savePools();
+
         logger.info(`📊 Discovery complete: ${totalDiscovered} pools → ${this.discoveredPools.size} active (≥$${this.minLiquidityUsd} TVL) → ${this.tradePairs.size} tradeable pairs`);
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════════
     //                    INCREMENTAL SCAN (NEW BLOCKS)
-    // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════════
 
     private async incrementalScan(): Promise<void> {
         const currentBlock = await this.provider.getBlockNumber();
@@ -368,16 +506,15 @@ export class PoolDiscovery {
         }
 
         this.lastScanBlock = currentBlock;
-
         if (newPools > 0) {
             logger.info(`🆕 Discovered ${newPools} new pools in blocks ${fromBlock}→${currentBlock}`);
             this.buildTradePairs();
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════════
     //                    FACTORY SCANNING
-    // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════════
 
     private async scanFactory(
         factory: FactoryConfig,
@@ -459,7 +596,6 @@ export class PoolDiscovery {
                     discovered++;
                 }
             } catch (error: any) {
-                // Reduce block range on RPC errors
                 logger.debug(`V3 scan chunk error at ${start}-${end}: ${error.message}`);
             }
         }
@@ -501,7 +637,6 @@ export class PoolDiscovery {
 
                     const token0Info = await this.tokenRegistry.resolveToken(token0);
                     const token1Info = await this.tokenRegistry.resolveToken(token1);
-
                     if (!token0Info || !token1Info) continue;
 
                     const pool: DiscoveredPool = {
@@ -566,10 +701,8 @@ export class PoolDiscovery {
                     const token1 = args[1] as string;
                     const stable = args[2] as boolean;
                     const poolAddress = args[3] as string;
-
                     const token0Info = await this.tokenRegistry.resolveToken(token0);
                     const token1Info = await this.tokenRegistry.resolveToken(token1);
-
                     if (!token0Info || !token1Info) continue;
 
                     const pool: DiscoveredPool = {
@@ -634,10 +767,8 @@ export class PoolDiscovery {
                     const token1 = args[1] as string;
                     const tickSpacing = Number(args[2]);
                     const poolAddress = args[3] as string;
-
                     const token0Info = await this.tokenRegistry.resolveToken(token0);
                     const token1Info = await this.tokenRegistry.resolveToken(token1);
-
                     if (!token0Info || !token1Info) continue;
 
                     const pool: DiscoveredPool = {
@@ -670,29 +801,93 @@ export class PoolDiscovery {
         return discovered;
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════════
     //                    LIQUIDITY REFRESH
-    // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════════
 
     private async refreshLiquidity(): Promise<void> {
-        const pools = Array.from(this.discoveredPools.values());
-        const BATCH_SIZE = 50;
+        const allPools = Array.from(this.discoveredPools.values());
+        
+        // Only fetch liquidity for pools with at least one known token
+        // This avoids wasting RPC calls on random shitcoin pools
+        const knownTokenAddresses = new Set(
+            Object.values(TOKENS).map(t => t.address.toLowerCase())
+        );
+        
+        const relevantPools = allPools.filter(pool => 
+            knownTokenAddresses.has(pool.token0.toLowerCase()) || 
+            knownTokenAddresses.has(pool.token1.toLowerCase())
+        );
+        
+        logger.info(`💧 Refreshing liquidity for ${relevantPools.length} relevant pools (out of ${allPools.length} total, filtered to pools with known tokens)`);
+        
+        if (relevantPools.length === 0) {
+            logger.warn(`⚠️  No relevant pools found! This means none of the discovered pools contain known tokens.`);
+            logger.warn(`⚠️  Known tokens: ${Array.from(knownTokenAddresses).slice(0, 5).map(a => a.slice(0, 10))}...`);
+            return;
+        }
+        
+        const BATCH_SIZE = 20; // Smaller batches to avoid rate limits
+        const BATCH_DELAY_MS = 200; // Delay between batches to avoid 429s
+        let successCount = 0;
+        let failCount = 0;
 
-        for (let i = 0; i < pools.length; i += BATCH_SIZE) {
-            const batch = pools.slice(i, i + BATCH_SIZE);
-            await Promise.allSettled(
+        for (let i = 0; i < relevantPools.length; i += BATCH_SIZE) {
+            const batch = relevantPools.slice(i, i + BATCH_SIZE);
+            const results = await Promise.allSettled(
                 batch.map((pool) => this.updatePoolLiquidity(pool))
             );
+            
+            // Count successes and failures
+            for (let j = 0; j < results.length; j++) {
+                const result = results[j];
+                const pool = batch[j];
+                if (result.status === "fulfilled") {
+                    successCount++;
+                    // Log pools with liquidity > 0
+                    if (pool.liquidityUsd > 0) {
+                        logger.debug(`  ✅ ${pool.dexName} ${pool.poolAddress.slice(0, 10)}...: $${pool.liquidityUsd.toFixed(2)} TVL`);
+                    }
+                } else {
+                    failCount++;
+                    logger.debug(`  ❌ ${pool.dexName} ${pool.poolAddress.slice(0, 10)}...: ${result.reason?.message || 'Unknown error'}`);
+                }
+            }
+            
+            // Save progress every 5 batches (100 pools)
+            if ((i / BATCH_SIZE) % 5 === 0 && i > 0) {
+                this.savePools();
+                logger.debug(`  💾 Saved liquidity progress: ${i}/${relevantPools.length} pools (✅ ${successCount} ❌ ${failCount})`);
+            }
+            
+            // Rate limit delay between batches
+            if (i + BATCH_SIZE < relevantPools.length) {
+                await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
+            }
         }
 
         // Mark pools as active/inactive based on liquidity
         let activeCount = 0;
+        let zeroLiquidityCount = 0;
+        let belowThresholdCount = 0;
+        
         for (const pool of this.discoveredPools.values()) {
-            pool.isActive = pool.liquidityUsd >= this.minLiquidityUsd;
+            // Only mark relevant pools as active
+            const isRelevant = knownTokenAddresses.has(pool.token0.toLowerCase()) || 
+                               knownTokenAddresses.has(pool.token1.toLowerCase());
+            
+            if (pool.liquidityUsd === 0) {
+                zeroLiquidityCount++;
+            } else if (pool.liquidityUsd < this.minLiquidityUsd) {
+                belowThresholdCount++;
+            }
+            
+            pool.isActive = isRelevant && pool.liquidityUsd >= this.minLiquidityUsd;
             if (pool.isActive) activeCount++;
         }
 
-        logger.debug(`💧 Liquidity refresh: ${activeCount}/${this.discoveredPools.size} pools active (≥$${this.minLiquidityUsd})`);
+        logger.info(`💧 Liquidity refresh complete: ${activeCount} active pools (✅ ${successCount} fetched, ❌ ${failCount} failed, ≥$${this.minLiquidityUsd} TVL)`);
+        logger.info(`   📊 Pool breakdown: ${zeroLiquidityCount} with $0 TVL, ${belowThresholdCount} below threshold, ${activeCount} active`);
     }
 
     private async updatePoolLiquidity(pool: DiscoveredPool): Promise<void> {
@@ -705,8 +900,13 @@ export class PoolDiscovery {
                 await this.updateV3Liquidity(pool);
             }
             pool.lastUpdated = Date.now();
-        } catch {
+        } catch (error: any) {
+            // Log first few errors to help debug
+            if (error.message?.includes("429") || error.message?.includes("rate")) {
+                logger.debug(`⚠️  Rate limited on pool ${pool.poolAddress.slice(0, 10)}...`);
+            }
             pool.isActive = false;
+            throw error; // Re-throw so Promise.allSettled can track it
         }
     }
 
@@ -725,27 +925,52 @@ export class PoolDiscovery {
         pool.liquidity = liquidity as bigint;
         const sqrtPriceX96 = slot0[0] as bigint;
 
-        // Estimate TVL from liquidity and price
-        // For V3, we approximate using the liquidity value and current price
         if (sqrtPriceX96 > 0n && pool.liquidity > 0n) {
-            const price = Number(sqrtPriceX96) / (2 ** 96);
-            const priceSquared = price * price;
+            // For V3 pools, we estimate TVL using a simpler approach:
+            // Use the token with a known price and estimate total value
+            const token0Info = this.tokenRegistry.getToken(pool.token0);
+            const token1Info = this.tokenRegistry.getToken(pool.token1);
 
-            // Approximate token amounts from concentrated liquidity
-            const liq = Number(pool.liquidity);
-            const amount0Approx = liq / (price * (10 ** ((pool.token0Decimals - pool.token1Decimals) / 2)));
-            const amount1Approx = liq * price * (10 ** ((pool.token0Decimals - pool.token1Decimals) / 2));
+            // Calculate price ratio from sqrtPriceX96
+            // price = (sqrtPriceX96 / 2^96)^2 * 10^(token0Decimals - token1Decimals)
+            const sqrtPrice = Number(sqrtPriceX96) / (2 ** 96);
+            const priceToken1PerToken0 = sqrtPrice * sqrtPrice * (10 ** (pool.token0Decimals - pool.token1Decimals));
 
-            const value0 = this.tokenRegistry.getTokenValueUsd(
-                pool.token0,
-                BigInt(Math.floor(Math.abs(amount0Approx)))
-            );
-            const value1 = this.tokenRegistry.getTokenValueUsd(
-                pool.token1,
-                BigInt(Math.floor(Math.abs(amount1Approx)))
-            );
+            // Try to calculate TVL using whichever token has a known price
+            let tvlCalculated = false;
 
-            pool.liquidityUsd = value0 + value1;
+            if (token0Info && token0Info.priceUsd > 0) {
+                // Estimate TVL as 2x the value of one side
+                // Use liquidity as a rough proxy for pool depth
+                const liq = Number(pool.liquidity);
+                const amount0 = liq / (sqrtPrice * (10 ** pool.token0Decimals));
+                const tvl0 = Math.abs(amount0) * token0Info.priceUsd;
+                pool.liquidityUsd = tvl0 * 2; // Both sides roughly equal
+                tvlCalculated = true;
+            } else if (token1Info && token1Info.priceUsd > 0) {
+                const liq = Number(pool.liquidity);
+                const amount1 = liq * sqrtPrice / (10 ** pool.token1Decimals);
+                const tvl1 = Math.abs(amount1) * token1Info.priceUsd;
+                pool.liquidityUsd = tvl1 * 2;
+                tvlCalculated = true;
+            } else {
+                // No known prices - try to estimate using liquidity alone
+                // This is a rough estimate but better than 0
+                // Assume average liquidity of $1000 per unit of liquidity
+                const liq = Number(pool.liquidity);
+                pool.liquidityUsd = liq * 1000; // Very rough estimate
+                tvlCalculated = true;
+            }
+
+            // Sanity check - cap at reasonable values
+            if (!isFinite(pool.liquidityUsd) || isNaN(pool.liquidityUsd) || pool.liquidityUsd < 0) {
+                pool.liquidityUsd = 0;
+            }
+
+            // Log if we're using estimated liquidity
+            if (!tvlCalculated || (token0Info?.priceUsd === 0 && token1Info?.priceUsd === 0)) {
+                logger.debug(`  📊 Pool ${pool.poolAddress.slice(0, 10)}...: Estimated TVL $${pool.liquidityUsd.toFixed(2)} (no price data)`);
+            }
         }
     }
 
@@ -775,15 +1000,14 @@ export class PoolDiscovery {
         const reserves = await contract.getReserves();
         pool.reserve0 = reserves[0] as bigint;
         pool.reserve1 = reserves[1] as bigint;
-
         const value0 = this.tokenRegistry.getTokenValueUsd(pool.token0, pool.reserve0);
         const value1 = this.tokenRegistry.getTokenValueUsd(pool.token1, pool.reserve1);
         pool.liquidityUsd = value0 + value1;
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════════
     //                    TRADE PAIR GENERATION
-    // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════════
 
     private buildTradePairs(): void {
         this.tradePairs.clear();
@@ -791,7 +1015,6 @@ export class PoolDiscovery {
         for (const pool of this.discoveredPools.values()) {
             if (!pool.isActive) continue;
 
-            // Normalize pair key (sorted by address)
             const [addrA, addrB] = pool.token0 < pool.token1
                 ? [pool.token0, pool.token1]
                 : [pool.token1, pool.token0];
@@ -820,15 +1043,13 @@ export class PoolDiscovery {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════════
     //                    PUBLIC ACCESSORS
-    // ═══════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════════════
 
-    /// @notice Returns all tradeable pairs with ≥2 pools (arb possible)
     getArbitrageablePairs(): TradePair[] {
         const pairs: TradePair[] = [];
         for (const pair of this.tradePairs.values()) {
-            // Need at least 2 pools on different DEXs for arbitrage
             const uniqueDexes = new Set(pair.pools.map((p) => p.dexId));
             if (uniqueDexes.size >= 2) {
                 pairs.push(pair);
@@ -837,7 +1058,6 @@ export class PoolDiscovery {
         return pairs.sort((a, b) => b.bestLiquidityUsd - a.bestLiquidityUsd);
     }
 
-    /// @notice Returns pairs formatted for StrategyManager consumption
     getDynamicPairs(): Array<{ tokenA: string; tokenB: string }> {
         return this.getArbitrageablePairs().map((pair) => ({
             tokenA: pair.tokenASymbol,
@@ -845,12 +1065,10 @@ export class PoolDiscovery {
         }));
     }
 
-    /// @notice Returns triangular paths from discovered pools
     getTriangularPaths(): Array<{ a: string; b: string; c: string }> {
         const paths: Array<{ a: string; b: string; c: string }> = [];
         const pairsByToken: Map<string, Set<string>> = new Map();
 
-        // Build adjacency map
         for (const pair of this.tradePairs.values()) {
             if (pair.pools.length < 1) continue;
 
@@ -864,7 +1082,6 @@ export class PoolDiscovery {
             pairsByToken.get(pair.tokenBSymbol)!.add(pair.tokenASymbol);
         }
 
-        // Find triangles: A→B→C→A
         const tokens = Array.from(pairsByToken.keys());
         const seen = new Set<string>();
 
@@ -873,19 +1090,18 @@ export class PoolDiscovery {
             if (!neighborsA) continue;
 
             for (const b of neighborsA) {
-                if (b <= a) continue; // Avoid duplicates
+                if (b <= a) continue;
                 const neighborsB = pairsByToken.get(b);
                 if (!neighborsB) continue;
 
                 for (const c of neighborsB) {
-                    if (c <= b) continue; // Avoid duplicates
-                    if (!neighborsA.has(c)) continue; // C must connect back to A
+                    if (c <= b) continue;
+                    if (!neighborsA.has(c)) continue;
 
                     const key = [a, b, c].sort().join("-");
                     if (seen.has(key)) continue;
                     seen.add(key);
 
-                    // Only include triangles with known Aave borrowable tokens
                     const borrowable = Object.keys(TOKENS);
                     if (borrowable.includes(a)) {
                         paths.push({ a, b, c });
@@ -901,7 +1117,6 @@ export class PoolDiscovery {
         return paths;
     }
 
-    /// @notice Get all pools for a specific token pair
     getPoolsForPair(tokenA: string, tokenB: string): DiscoveredPool[] {
         const addrA = tokenA.toLowerCase();
         const addrB = tokenB.toLowerCase();
@@ -914,7 +1129,6 @@ export class PoolDiscovery {
         );
     }
 
-    /// @notice Get discovery statistics
     getStats(): {
         totalPools: number;
         activePools: number;
@@ -933,7 +1147,6 @@ export class PoolDiscovery {
         };
     }
 
-    /// @notice Get the token registry for external use
     getTokenRegistry(): TokenRegistry {
         return this.tokenRegistry;
     }
